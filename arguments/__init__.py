@@ -122,6 +122,13 @@ class OptimizationParams(ParamGroup):
 
         self.tau_GS = 0.2
         self.tau_GP = 0.8
+        # Dynamic-branch pruning cutoff. gradient_pruning keeps
+        #   (top (1-v_cutoff) by view grad) UNION (top (1-t_cutoff) by t grad);
+        # the second term is what protects moving Gaussians. Splitting it from
+        # tau_GP lets a scene stay aggressive on static content while keeping
+        # far more of the dynamic content, which is where the visible quality
+        # loss concentrates. -1 = use tau_GP for both (original behaviour).
+        self.tau_GP_t = -1.0
         self.tau_sim = 0.0003
 
         self.grid_exp_ratio = 1.2

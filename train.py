@@ -236,7 +236,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 #gradient pruning
                 if iteration == grad_pruning_iter:
-                    gaussians.gradient_pruning(view_grad, t_grad, opt.tau_GP, opt.tau_GP, args, mask)
+                    tau_gp_t = opt.tau_GP if opt.tau_GP_t < 0 else opt.tau_GP_t
+                    gaussians.gradient_pruning(view_grad, t_grad, opt.tau_GP, tau_gp_t, args, mask)
                     torch.cuda.empty_cache() 
 
                 #gaussian merging
