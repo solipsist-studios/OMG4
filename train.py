@@ -241,10 +241,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 #gaussian merging
                 if iteration == first_merge_iter:
-                    gaussians.calc_clusters(grid_size=grid_size, tau_sim=tau_sim, sim_cutoff=sim_cutoff, t_grid_size=opt.t_grid_size)
-                    if opt.grid_exp_ratio:
-                        grid_size *= opt.grid_exp_ratio
-                    gaussians.set_alpha_groups()
+                    if args.spm_native_out and not num_merge:
+                        # merging disabled: go straight to the explicit-SH recovery
+                        spm_native_end = iteration + args.spm_native_extra_iter
+                        print(f"SPM-native: merging disabled; fine-tuning explicit SH until iter {spm_native_end}")
+                        loss_log_file.write(f"SPM-native: no merge, explicit-SH fine-tune until {spm_native_end}.\n")
+                    else:
+                        gaussians.calc_clusters(grid_size=grid_size, tau_sim=tau_sim, sim_cutoff=sim_cutoff, t_grid_size=opt.t_grid_size)
+                        if opt.grid_exp_ratio:
+                            grid_size *= opt.grid_exp_ratio
+                        gaussians.set_alpha_groups()
 
                 if num_merge and iteration % 1000 == 0 and iteration > first_merge_iter:
                     print(iteration,"Pruning merged Gaussians using learned alpha...")
