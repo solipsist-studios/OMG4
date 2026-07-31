@@ -19,7 +19,10 @@ class DynamicGaussians(nn.Module):
 
         param_names = [
             "means", "scales", "quats", "opacities",
-            "sh_0", "sh_n", "times", "durations", "velocities"
+            "sh_0", "sh_n", "times", "durations", "velocities",
+            # degree-2 motion: quadratic coefficient (units/sec^2),
+            # center(t) = x + v*dt + a*dt^2; zero for degree-1 content
+            "accels"
         ]
 
         for name in param_names:
@@ -39,6 +42,7 @@ class DynamicGaussians(nn.Module):
             self.times.zero_()
             self.durations.zero_()
             self.velocities.zero_()
+            self.accels.zero_()
         
     def construct_net(self, train=True):
         import tinycudann as tcnn
@@ -170,6 +174,16 @@ class DynamicGaussians(nn.Module):
                 cluster_centers = save_dict['velocities_code'][i]
                 velocities.append(torch.tensor(cluster_centers[labels]).cuda())
             self.velocities = torch.nn.Parameter(torch.cat(velocities, dim=-1).float().requires_grad_(True))
+
+            if 'accels_code' in save_dict:
+                accels = []
+                for i in range(len(save_dict['accels_code'])):
+                    labels = huffman_decode(save_dict['accels_index'][i], save_dict['accels_htable'][i])
+                    cluster_centers = save_dict['accels_code'][i]
+                    accels.append(torch.tensor(cluster_centers[labels]).cuda())
+                self.accels = torch.nn.Parameter(torch.cat(accels, dim=-1).float().requires_grad_(True))
+            elif 'accels' in save_dict:
+                self.accels = torch.nn.Parameter(torch.from_numpy(save_dict['accels']).cuda().float().requires_grad_(True))
             
             for i in range(len(save_dict['app_code'])):
                 labels = huffman_decode(save_dict['app_index'][i], save_dict['app_htable'][i])
