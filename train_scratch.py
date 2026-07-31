@@ -66,16 +66,17 @@ def depth_prior_loss(render_depth, alpha, image_path):
     meaningful. Weighted by rendered alpha so empty pixels, where the rendered
     depth is meaningless, do not vote.
     """
+    zero = render_depth.sum() * 0.0     # keeps dtype/device/graph, contributes nothing
     prior = _depth_prior(image_path, render_depth.device)
     if prior is None:
-        return None
+        return zero
     d = render_depth.reshape(1, 1, *render_depth.shape[-2:])
     p = torch.nn.functional.interpolate(prior, size=d.shape[-2:],
                                         mode='bilinear', align_corners=False)
     w = alpha.reshape(1, 1, *alpha.shape[-2:]).clamp(0, 1)
     m = (w > 0.5)
     if m.sum() < 64:
-        return None
+        return zero
     x = d[m]
     y = p[m]
     x = x - x.mean()
@@ -191,9 +192,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     # freedom with layered splats that satisfy the training views
                     # and separate into visible shells from any other angle.
                     Ldepth = depth_prior_loss(depth, alpha, viewpoint_cam.image_path)
-                    if Ldepth is not None:
-                        loss = loss + opt.lambda_depth * Ldepth
-                        last_Ldepth = Ldepth
+                    loss = loss + opt.lambda_depth * Ldepth
+                    last_Ldepth = Ldepth
 
                 if opt.lambda_aniso > 0:
                     sc = gaussians.get_scaling
