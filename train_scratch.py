@@ -34,6 +34,57 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
+_DEPTH_PRIOR_CACHE = {}
+
+
+def _depth_prior(image_path, device):
+    """Cached DA3 depth prior for a training view (see make_depth_priors.py).
+
+    Returns a [1,1,h,w] tensor at the prior's own resolution, or None when no
+    prior exists for this view (so a partially-covered dataset still trains).
+    """
+    import numpy as _np
+    _MISS = object()
+    hit = _DEPTH_PRIOR_CACHE.get(image_path, _MISS)
+    if hit is _MISS:
+        base, _ = os.path.splitext(image_path)
+        cand = base + '_depth.npy'
+        if os.path.exists(cand):
+            arr = _np.load(cand).astype(_np.float32)
+            hit = torch.from_numpy(arr)[None, None]
+        else:
+            hit = None
+        _DEPTH_PRIOR_CACHE[image_path] = hit
+    return None if hit is None else hit.to(device, non_blocking=True)
+
+
+def depth_prior_loss(render_depth, alpha, image_path):
+    """Scale-shift-invariant agreement between the rendered depth and the prior.
+
+    Pearson correlation over the subject only: the prior carries DA3's own
+    scale and shift, so only the ORDERING of depths within the subject is
+    meaningful. Weighted by rendered alpha so empty pixels, where the rendered
+    depth is meaningless, do not vote.
+    """
+    prior = _depth_prior(image_path, render_depth.device)
+    if prior is None:
+        return None
+    d = render_depth.reshape(1, 1, *render_depth.shape[-2:])
+    p = torch.nn.functional.interpolate(prior, size=d.shape[-2:],
+                                        mode='bilinear', align_corners=False)
+    w = alpha.reshape(1, 1, *alpha.shape[-2:]).clamp(0, 1)
+    m = (w > 0.5)
+    if m.sum() < 64:
+        return None
+    x = d[m]
+    y = p[m]
+    x = x - x.mean()
+    y = y - y.mean()
+    denom = torch.sqrt((x * x).sum() * (y * y).sum()).clamp(min=1e-8)
+    # both are distances (larger = farther), so agreement is positive corr
+    return 1.0 - (x * y).sum() / denom
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint, debug_from,
              gaussian_dim, time_duration, num_pts, num_pts_ratio, rot_4d, force_sh_3d, batch_size):
     
@@ -107,6 +158,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration - 1) == debug_from:
                 pipe.debug = True
             
+            last_Ldepth = None
             batch_point_grad = []
             batch_visibility_filter = []
             batch_radii = []
@@ -132,6 +184,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 # novel angle. Measured on heidi: aspect p50 24.9 / p95 2970 vs
                 # 8.9-10.5 / 74-429 on captures that look correct. Penalising the
                 # ratio forces coverage to be achieved with rounder splats.
+                if opt.lambda_depth > 0:
+                    # Sparse cameras leave depth along the ray under-constrained:
+                    # the silhouette says where the subject is in the image, never
+                    # how deep into it a Gaussian belongs. The optimiser fills that
+                    # freedom with layered splats that satisfy the training views
+                    # and separate into visible shells from any other angle.
+                    Ldepth = depth_prior_loss(depth, alpha, viewpoint_cam.image_path)
+                    if Ldepth is not None:
+                        loss = loss + opt.lambda_depth * Ldepth
+                        last_Ldepth = Ldepth
+
                 if opt.lambda_aniso > 0:
                     sc = gaussians.get_scaling
                     ratio = sc.max(dim=1).values / sc.min(dim=1).values.clamp(min=1e-8)
@@ -211,6 +274,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             iter_end.record()
             loss_dict = {"Ll1": Ll1,
                         "Lssim": Lssim}
+            if last_Ldepth is not None:
+                loss_dict["Ldepth"] = last_Ldepth
 
             with torch.no_grad():
                 psnr_for_log = psnr(image, gt_image).mean().double()

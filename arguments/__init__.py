@@ -125,6 +125,11 @@ class OptimizationParams(ParamGroup):
         # 0 disables, preserving upstream behaviour exactly.
         self.lambda_aniso = 0.0
         self.aniso_max = 6.0
+        # Depth-prior supervision (see train_scratch.py). Sparse cameras leave
+        # depth along the view ray nearly free; a per-view prior constrains it.
+        # The prior's scale/shift are its own, so the loss is Pearson
+        # correlation over the subject mask (scale-shift invariant). 0 = off.
+        self.lambda_depth = 0.0
         self.tau_GS = 0.2
         self.tau_GP = 0.8
         # Dynamic-branch pruning cutoff. gradient_pruning keeps
