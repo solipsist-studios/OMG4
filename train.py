@@ -10,6 +10,9 @@
 #
 
 import os
+
+def _identity_collate(batch):
+    return batch
 import random
 import sys
 import uuid
@@ -74,6 +77,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     os.makedirs(os.path.join(dataset.model_path, "test"), exist_ok=True)
 
     num_merge = opt.num_merge
+    spm_native_end = None
 
     compression_start = 30000   # After 4DGS training
     grad_pruning_iter = compression_start + opt.grad_pruning_iter
@@ -87,8 +91,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     try:
         view_grad = np.load(os.path.join(args.grad, 'view_grad.npy'))
         t_grad = np.load(os.path.join(args.grad, 't_grad.npy'))
-    except:
-        print("Error: please calculate gradient first")
+    except Exception as e:
+        print(f"Error loading gradients from {args.grad}: {e}")
+        print("Please calculate gradient first using compute_gradient.py")
+        sys.exit(1)
 
     #gradient sampling
     mask = gaussians.gradient_sampling(opt.tau_GS, view_grad, t_grad, args)
@@ -116,7 +122,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians.env_map = env_map
         
     training_dataset = scene.getTrainCameras()
-    training_dataloader = DataLoader(training_dataset, batch_size=batch_size, shuffle=True, num_workers=12 if dataset.dataloader else 0, collate_fn=lambda x: x, drop_last=True)
+    _dl_workers = 12 if dataset.dataloader else 0
+    training_dataloader = DataLoader(training_dataset, batch_size=batch_size, shuffle=True, num_workers=_dl_workers, collate_fn=_identity_collate, drop_last=True,
+                                     multiprocessing_context=('spawn' if (_dl_workers > 0 and os.environ.get('OMG4_DL_SPAWN')) else None))
      
     iteration = first_iter
     lpips_model = lpips.LPIPS(net='alex')   # vgg for Bartender
@@ -250,21 +258,25 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         gaussians.calc_clusters(grid_size=grid_size, tau_sim=tau_sim, sim_cutoff=sim_cutoff, t_grid_size=opt.t_grid_size)
                         gaussians.set_alpha_groups()
                     
+                    elif args.spm_native_out:   # merging done: keep explicit SH
+                        spm_native_end = iteration + args.spm_native_extra_iter
+                        print(f"SPM-native: skipping appearance net; fine-tuning explicit SH until iter {spm_native_end}")
+                        loss_log_file.write(f"SPM-native: explicit-SH fine-tune until {spm_native_end}.\n")
                     else:   # merging is done, construct net
                         print("start training network")
                         loss_log_file.write(f"Start training network.\n")
                         gaussians.construct_net()
 
                 #3d svq
-                if iteration == svq3d_iter:
+                if iteration == svq3d_iter and not args.spm_native_out:
                     loss_log_file.write(f"3D svq start\n.")
                     gaussians.apply_svq_3d(args)
                 #4d svq
-                if iteration == svq4d_iter:
+                if iteration == svq4d_iter and not args.spm_native_out:
                     loss_log_file.write(f"4D svq start\n.")
                     gaussians.apply_svq_4d(args)
 
-                if iteration == encode_iter:
+                if iteration == encode_iter and not args.spm_native_out:
                     print("comp")
                     save_dict = gaussians.encode()     
                     save_comp(scene.model_path + "/comp.xz", save_dict)
@@ -329,6 +341,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         if hasattr(gaussians, "optimizer_code_4d") and gaussians.optimizer_code_4d is not None:
                             gaussians.optimizer_code_4d.step()
                             gaussians.optimizer_code_4d.zero_grad()
+
+            if spm_native_end is not None and iteration >= spm_native_end:
+                import torch as _torch
+                _torch.save((gaussians.capture(), iteration), args.spm_native_out)
+                n = gaussians._xyz.shape[0]
+                print(f"SPM-native: saved explicit-SH checkpoint ({n} splats) -> {args.spm_native_out}")
+                loss_log_file.write(f"SPM-native checkpoint saved at {iteration} ({n} splats).\n")
+                loss_log_file.close()
+                return
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -465,6 +486,13 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--spm_native_out", type=str, default=None,
+                        help="SPM-native mode: after sampling->pruning->merging plus "
+                             "--spm_native_extra_iter recovery iterations, save an explicit-SH "
+                             "rotor checkpoint (gaussians.capture()) to this path and exit "
+                             "WITHOUT distilling appearance into MLPs or running SVQ.")
+    parser.add_argument("--spm_native_extra_iter", type=int, default=3000,
+                        help="fine-tune iterations after the last merge in --spm_native_out mode")
     
     parser.add_argument("--gaussian_dim", type=int, default=3)
     parser.add_argument("--time_duration", nargs=2, type=float, default=[-0.5, 0.5])
