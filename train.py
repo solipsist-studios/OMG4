@@ -69,6 +69,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
 
+    if args.spm_native_out and args.spm_native_freeze_temporal:
+        frozen = ('t', 'scaling_t', 'rotation_r')
+        for g in gaussians.optimizer.param_groups:
+            if g['name'] in frozen:
+                g['lr'] = 0.0
+        print(f"SPM-native: froze temporal parameter groups {frozen}")
+
     first_iter = 30000
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -500,6 +507,15 @@ if __name__ == "__main__":
                              "WITHOUT distilling appearance into MLPs or running SVQ.")
     parser.add_argument("--spm_native_extra_iter", type=int, default=3000,
                         help="fine-tune iterations after the last merge in --spm_native_out mode")
+    parser.add_argument("--spm_native_freeze_temporal", action="store_true",
+                        help="freeze t / scaling_t / rotation_r during SPM-native recovery. "
+                             "update_learning_rate() decays ONLY the xyz group and returns, so "
+                             "every other group keeps its INITIAL lr for the whole run: by the "
+                             "recovery phase xyz has decayed ~100x while the temporal centre "
+                             "still moves at position_lr_init and temporal sigma at a constant "
+                             "scaling_lr. The pretrain already fit those well; letting them "
+                             "drift during recovery costs almost nothing on still frames and a "
+                             "great deal on fast ones.")
     
     parser.add_argument("--gaussian_dim", type=int, default=3)
     parser.add_argument("--time_duration", nargs=2, type=float, default=[-0.5, 0.5])
