@@ -120,6 +120,11 @@ class OptimizationParams(ParamGroup):
         self.svq3d_opt_iter = 1000
         self.svq4d_opt_iter = 1000
 
+        # Anisotropy regularisation (see train_scratch.py). aniso_max is the
+        # tolerated max/min scale ratio; splats above it are penalised linearly.
+        # 0 disables, preserving upstream behaviour exactly.
+        self.lambda_aniso = 0.0
+        self.aniso_max = 6.0
         self.tau_GS = 0.2
         self.tau_GP = 0.8
         # Dynamic-branch pruning cutoff. gradient_pruning keeps
