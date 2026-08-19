@@ -4,7 +4,12 @@ import torch
 def render(viewpoint_camera, pc, w2c, K_s):
     means = pc.means
     t=viewpoint_camera.timestamp
-    means_t = means + (t - pc.times) * pc.velocities
+    dt = t - pc.times
+    means_t = means + dt * pc.velocities
+    # degree-2 motion: center(t) = x + v*dt + a*dt^2 (zero-init accels
+    # leave degree-1 checkpoints bit-identical)
+    if getattr(pc, 'accels', None) is not None and pc.accels.shape[0] == means.shape[0]:
+        means_t = means_t + (dt * dt) * pc.accels
     scales = torch.exp(pc.scales)
     _temporal_opacity =  torch.exp(-0.5 * ((t - pc.times) / pc.durations.exp()) ** 2)
     quats = pc.quats

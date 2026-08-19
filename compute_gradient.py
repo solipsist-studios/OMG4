@@ -10,6 +10,9 @@
 #
 
 import os
+
+def _identity_collate(batch):
+    return batch
 import random
 import torch
 from torch import nn
@@ -37,7 +40,7 @@ from PIL import Image
 import torchvision.transforms as T
 
 def main(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint, debug_from,
-             gaussian_dim, time_duration, num_pts, num_pts_ratio, rot_4d, force_sh_3d, batch_size, out_path = None):
+             gaussian_dim, time_duration, num_pts, num_pts_ratio, rot_4d, force_sh_3d, batch_size, out_path = None, num_images = -1):
     if dataset.frame_ratio > 1:
         time_duration = [time_duration[0] / dataset.frame_ratio,  time_duration[1] / dataset.frame_ratio]
     
@@ -62,12 +65,14 @@ def main(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint, 
     os.makedirs(os.path.join(dataset.model_path, "test"), exist_ok=True)
 
 
-    calc_gradient(dataset, opt, pipe, scene, gaussians, batch_size, bg_color, background)
+    calc_gradient(dataset, opt, pipe, scene, gaussians, batch_size, bg_color, background, num_images)
 
-def calc_gradient(dataset, opt, pipe, scene, gaussians, batch_size, bg_color, background):
+def calc_gradient(dataset, opt, pipe, scene, gaussians, batch_size, bg_color, background, num_images = -1):
 
     training_dataset = scene.getTrainCameras()
-    training_dataloader = DataLoader(training_dataset, batch_size=batch_size, shuffle=True, num_workers=12 if dataset.dataloader else 0, collate_fn=lambda x: x, drop_last=True)
+    _dl_workers = 12 if dataset.dataloader else 0
+    training_dataloader = DataLoader(training_dataset, batch_size=batch_size, shuffle=True, num_workers=_dl_workers, collate_fn=_identity_collate, drop_last=True,
+                                     multiprocessing_context=('spawn' if (_dl_workers > 0 and os.environ.get('OMG4_DL_SPAWN')) else None))
      
     
     N = gaussians._xyz.shape[0]
@@ -76,15 +81,18 @@ def calc_gradient(dataset, opt, pipe, scene, gaussians, batch_size, bg_color, ba
     T = len(timestamps)
 
     training_dataset = scene.getTrainCameras()
-    viewspace_grad = torch.zeros((N, T), dtype=torch.float32, device='cuda')
-    t_grad = torch.zeros((N, T), dtype=torch.float32, device='cuda')
+    viewspace_grad = torch.zeros((N,), dtype=torch.float32, device='cuda')
+    t_grad = torch.zeros((N,), dtype=torch.float32, device='cuda')
 
-    for idx in tqdm(range(len(training_dataset)), desc="Computing Gradients"):
+    if num_images > 0:
+        num_iter = min(num_images, len(training_dataset))
+    else:
+        num_iter = len(training_dataset)
+
+    for idx in tqdm(range(num_iter), desc="Computing Gradients"):
         gt_image, viewpoint_cam = training_dataset[idx]
         gt_image= gt_image.cuda()
         viewpoint_cam = viewpoint_cam.cuda()
-        timestamp = viewpoint_cam.timestamp
-        index = timestamps.index(timestamp)
 
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
@@ -102,23 +110,24 @@ def calc_gradient(dataset, opt, pipe, scene, gaussians, batch_size, bg_color, ba
 
 
         batch_point_grad = (torch.norm(viewspace_point_tensor.grad[:,:2], dim=-1)) 
-        viewspace_grad[:, index] += batch_point_grad
-        t_grad[:, index]  += gaussians._t.grad.clone().detach().squeeze(1) 
+        viewspace_grad += batch_point_grad
+        t_grad  += gaussians._t.grad.clone().detach().squeeze(1) 
+
+        gaussians.optimizer.zero_grad(set_to_none=True)
+        viewspace_point_tensor.grad = None
 
 
-    final_view_grad = viewspace_grad.sum(dim = 1)
-    final_t_grad = t_grad.sum(dim = 1)
+    final_view_grad = viewspace_grad
+    final_t_grad = t_grad
+
     
     if torch.is_tensor(final_view_grad):
         final_view_grad = final_view_grad.detach().cpu().numpy()
     if torch.is_tensor(final_t_grad):
         final_t_grad = final_t_grad.detach().cpu().numpy()
-    import pdb; pdb.set_trace()
 
-    os.makedirs(os.path.join(scene.model_path, "gradient"), exist_ok=True)
-
-    np.save(os.path.join(scene.model_path, "gradient/view_grad.npy"), final_view_grad)
-    np.save(os.path.join(scene.model_path, "gradient/t_grad.npy"), final_t_grad)
+    np.save(os.path.join(scene.model_path, "view_grad.npy"), final_view_grad)
+    np.save(os.path.join(scene.model_path, "t_grad.npy"), final_t_grad)
 
 
 
@@ -154,6 +163,7 @@ if __name__ == "__main__":
     parser.add_argument("--exhaust_test", action="store_true")
     parser.add_argument("--grad", type=str, default = None)
     parser.add_argument("--out_path", type=str, default = None)
+    parser.add_argument("--num_images", type=int, default = -1)
         
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -182,7 +192,7 @@ if __name__ == "__main__":
 
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     main(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.start_checkpoint, args.debug_from,
-             args.gaussian_dim, args.time_duration, args.num_pts, args.num_pts_ratio, args.rot_4d, args.force_sh_3d, args.batch_size, args.out_path)
+             args.gaussian_dim, args.time_duration, args.num_pts, args.num_pts_ratio, args.rot_4d, args.force_sh_3d, args.batch_size, args.out_path, args.num_images)
 
     # All done
     print("\nComputing complete.")
