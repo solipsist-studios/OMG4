@@ -9,12 +9,12 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import math
 import torch
 from torch import nn
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix, getProjectionMatrixCenterShift
 from kornia import create_meshgrid
-from copy import deepcopy
 
 class Camera:
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
@@ -64,6 +64,17 @@ class Camera:
 
         self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1)
         if cx > 0:
+            # Replace the FoV=-1 sentinel with the real FoV so downstream
+            # consumers (gaussian_renderer's tanfovx/tanfovy -> the CUDA
+            # rasterizer's EWA Jacobian focal) stay consistent with the
+            # projection matrix. Without this, splats are trained/rendered
+            # with footprints inflated by W/(2*tan(0.5)*fl_x) horizontally
+            # and H/(2*tan(0.5)*fl_y) vertically, and exported models look
+            # thin/streaky in geometrically-correct renderers.
+            if self.FoVx is None or self.FoVx <= 0:
+                self.FoVx = 2 * math.atan(self.image_width / (2 * fl_x))
+            if self.FoVy is None or self.FoVy <= 0:
+                self.FoVy = 2 * math.atan(self.image_height / (2 * fl_y))
             self.projection_matrix = getProjectionMatrixCenterShift(self.znear, self.zfar, cx, cy, fl_x, fl_y, self.image_width, self.image_height).transpose(0,1)
         else:
             self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1)
@@ -82,11 +93,15 @@ class Camera:
         return self.camera_center[None,None], directions / torch.norm(directions, dim=-1, keepdim=True)
     
     def cuda(self):
-        cuda_copy = deepcopy(self)
-        for k, v in cuda_copy.__dict__.items():
+        # Must move to the training device regardless of data_device: data_device is the
+        # STORAGE device (cpu storage enables multiprocess dataloader workers), while
+        # .cuda() is called by the training loop to stage a batch onto the GPU. The
+        # original `v.to(self.data_device)` silently no-opped for cpu storage, leaving
+        # camera matrices on CPU against CUDA gaussians -> NaN training collapse.
+        for k, v in self.__dict__.items():
             if isinstance(v, torch.Tensor):
-                cuda_copy.__dict__[k] = v.to(cuda_copy.data_device)
-        return cuda_copy
+                self.__dict__[k] = v.to("cuda")
+        return self
     
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):
