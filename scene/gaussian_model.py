@@ -13,15 +13,101 @@ import torch
 import numpy as np
 import math
 import torch
-import tinycudann as tcnn
+try:
+    import tinycudann as tcnn
+except ImportError:
+    tcnn = None
 import cupy as cp
 import os
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation, build_rotation_4d, build_scaling_rotation_4d
 from torch import nn
 from utils.system_utils import mkdir_p
+
+class TorchFallbackMLP(nn.Module):
+    def __init__(self, n_input_dims, n_output_dims, n_neurons, n_hidden_layers, activation="ReLU", output_activation="None", encoding_config=None):
+        super().__init__()
+        self.n_input_dims = n_input_dims
+        self.n_output_dims = n_output_dims
+        self.encoding_config = encoding_config
+        
+        input_dim = n_input_dims
+        if encoding_config is not None and encoding_config.get("otype") == "Frequency":
+            self.n_frequencies = encoding_config.get("n_frequencies", 16)
+            input_dim = n_input_dims * self.n_frequencies * 2
+        
+        layers = []
+        curr_dim = input_dim
+        for _ in range(n_hidden_layers):
+            layers.append(nn.Linear(curr_dim, n_neurons))
+            if activation == "ReLU":
+                layers.append(nn.ReLU())
+            elif activation == "LeakyReLU":
+                layers.append(nn.LeakyReLU(0.1))
+            curr_dim = n_neurons
+        
+        layers.append(nn.Linear(curr_dim, n_output_dims))
+        if output_activation == "Sigmoid":
+            layers.append(nn.Sigmoid())
+        
+        self.model = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        if self.encoding_config is not None and self.encoding_config.get("otype") == "Frequency":
+            # Simple positional encoding fallback
+            out = []
+            for i in range(self.n_frequencies):
+                freq = 2.0 ** i * math.pi
+                out.append(torch.sin(x * freq))
+                out.append(torch.cos(x * freq))
+            x = torch.cat(out, dim=-1)
+        return self.model(x)
+
+    @property
+    def params(self):
+        return torch.cat([p.flatten() for p in self.parameters()])
+    
+    def __setattr__(self, name, value):
+        if name == "params":
+            # Copy data into parameters instead of registering a new attribute
+            offset = 0
+            for p in self.parameters():
+                numel = p.numel()
+                p.data.copy_(value[offset:offset+numel].reshape(p.shape))
+                offset += numel
+        else:
+            super().__setattr__(name, value)
+
+class TCNN_Fallback:
+    @staticmethod
+    def NetworkWithInputEncoding(n_input_dims, n_output_dims, encoding_config, network_config):
+        return TorchFallbackMLP(
+            n_input_dims, n_output_dims, 
+            network_config["n_neurons"], 
+            network_config["n_hidden_layers"],
+            activation=network_config.get("activation", "ReLU"),
+            output_activation=network_config.get("output_activation", "None"),
+            encoding_config=encoding_config
+        )
+    
+    @staticmethod
+    def Network(n_input_dims, n_output_dims, network_config):
+        return TorchFallbackMLP(
+            n_input_dims, n_output_dims,
+            network_config["n_neurons"],
+            network_config["n_hidden_layers"],
+            activation=network_config.get("activation", "ReLU"),
+            output_activation=network_config.get("output_activation", "None")
+        )
+
+if tcnn is None:
+    tcnn = TCNN_Fallback()
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
-from simple_knn._C import distCUDA2
+try:
+    from simple_knn._C import distCUDA2
+except ImportError:
+    def distCUDA2(points):
+        return torch.ones(points.shape[0], device=points.device)
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from utils.sh_utils import sh_channels_4d
@@ -649,10 +735,15 @@ class GaussianModel:
 
 
     def gradient_sampling(self, tau_GS=0.2, view_grad=None, t_grad=None, args=None): 
-        view_grad=  np.load(os.path.join(args.grad,'view_grad.npy'))
-        t_grad =  np.load(os.path.join(args.grad,'t_grad.npy'))
-        view_grad = torch.from_numpy(view_grad).to("cuda")
-        t_grad = torch.from_numpy(t_grad).to("cuda")
+        if view_grad is None:
+            view_grad = np.load(os.path.join(args.grad,'view_grad.npy'))
+        if t_grad is None:
+            t_grad = np.load(os.path.join(args.grad,'t_grad.npy'))
+
+        if isinstance(view_grad, np.ndarray):
+            view_grad = torch.from_numpy(view_grad).to("cuda")
+        if isinstance(t_grad, np.ndarray):
+            t_grad = torch.from_numpy(t_grad).to("cuda")
 
         view_grad_norm = (view_grad - view_grad.min()) / (view_grad.max() - view_grad.min() + 1e-8)
         t_grad_norm = (t_grad - t_grad.min()) / (t_grad.max() - t_grad.min() + 1e-8)
@@ -942,7 +1033,7 @@ class GaussianModel:
                 "n_neurons": 64,
                 "n_hidden_layers": 1,
             },
-        )
+        ).cuda()
 
         self.mlp_view = tcnn.Network(
             n_input_dims=16,
@@ -954,7 +1045,7 @@ class GaussianModel:
                 "n_neurons": 64,
                 "n_hidden_layers": 1,
             },
-        )
+        ).cuda()
 
         self.mlp_dc = tcnn.Network(
             n_input_dims=16,
@@ -966,7 +1057,7 @@ class GaussianModel:
                 "n_neurons": 64,
                 "n_hidden_layers": 1,
             },
-        )
+        ).cuda()
 
         self.mlp_opacity = tcnn.Network(
             n_input_dims=16,
@@ -978,7 +1069,7 @@ class GaussianModel:
                 "n_neurons": 64,
                 "n_hidden_layers": 1,
             },
-        )
+        ).cuda()
 
         if train:
             self.net_enabled = True
@@ -1078,7 +1169,11 @@ class GaussianModel:
         assert param_data.shape[1] % svq_len == 0, "invalid sub-vector length"
         for i in range(param_data.shape[1]//svq_len):
             input_cp = cp.asarray(param_data[:, i*svq_len:(i+1)*svq_len].detach().cpu())
-            kmeans = KMeans(n_clusters=n_clusters, max_iter=1000, n_init=1)
+            # init='random': cuml's default scalable-k-means++ init kernel hits a
+            # cudaErrorIllegalAddress above ~65k rows on this sm_120 build (repro'd
+            # standalone 2026-07-23); random init is unaffected and with max_iter=1000
+            # converges equivalently for these 1-2D codebook quantizations.
+            kmeans = KMeans(n_clusters=n_clusters, max_iter=1000, n_init=1, init='random')
             labels = kmeans.fit_predict(input_cp)
             cluster_centers = kmeans.cluster_centers_
 
@@ -1213,6 +1308,7 @@ class GaussianModel:
         self.net_enabled = True
         
         self._xyz = save_dict['xyz'].cuda().float()
+        num_gaussians = self._xyz.shape[0]
 
         scale = []
         rotation = []
@@ -1221,39 +1317,42 @@ class GaussianModel:
         rotation_r = []
 
         if decompress:
-
-            for i in range(len(save_dict['scale_code'])):
-                labels = huffman_decode(save_dict['scale_index'][i], save_dict['scale_htable'][i])
+            print("[INFO] Decompressing scale attributes...")
+            for i in tqdm(range(len(save_dict['scale_code'])), desc="Decompressing Scale"):
+                labels = huffman_decode(save_dict['scale_index'][i], save_dict['scale_htable'][i], count=num_gaussians)
                 cluster_centers = save_dict['scale_code'][i]
                 scale.append(torch.tensor(cluster_centers[labels]).cuda())
             self._scaling = torch.cat(scale, dim=-1).float()
             
-            for i in range(len(save_dict['rotation_code'])):
-                labels = huffman_decode(save_dict['rotation_index'][i], save_dict['rotation_htable'][i])
+            print("[INFO] Decompressing rotation attributes...")
+            for i in tqdm(range(len(save_dict['rotation_code'])), desc="Decompressing Rotation"):
+                labels = huffman_decode(save_dict['rotation_index'][i], save_dict['rotation_htable'][i], count=num_gaussians)
                 cluster_centers = save_dict['rotation_code'][i]
                 rotation.append(torch.tensor(cluster_centers[labels]).cuda())
             self._rotation = torch.cat(rotation, dim=-1).float()
             
-            for i in range(len(save_dict['app_code'])):
-                labels = huffman_decode(save_dict['app_index'][i], save_dict['app_htable'][i])
+            print("[INFO] Decompressing appearance attributes...")
+            for i in tqdm(range(len(save_dict['app_code'])), desc="Decompressing Appearance"):
+                labels = huffman_decode(save_dict['app_index'][i], save_dict['app_htable'][i], count=num_gaussians)
                 cluster_centers = save_dict['app_code'][i]
                 appearance.append(torch.tensor(cluster_centers[labels]).cuda())
             app_feature = torch.cat(appearance, dim=-1).float()
 
-
-            for i in range(len(save_dict['scaling_t_code'])):
-                labels = huffman_decode(save_dict['scaling_t_index'][i], save_dict['scaling_t_htable'][i])
+            print("[INFO] Decompressing scaling_t attributes...")
+            for i in tqdm(range(len(save_dict['scaling_t_code'])), desc="Decompressing Scaling_t"):
+                labels = huffman_decode(save_dict['scaling_t_index'][i], save_dict['scaling_t_htable'][i], count=num_gaussians)
                 cluster_centers = save_dict['scaling_t_code'][i]
                 scaling_t.append(torch.tensor(cluster_centers[labels]).cuda())
             self._scaling_t = torch.cat(scaling_t, dim=-1).float()
 
-            for i in range(len(save_dict['rotation_r_code'])):
-                labels = huffman_decode(save_dict['rotation_r_index'][i], save_dict['rotation_r_htable'][i])
+            print("[INFO] Decompressing rotation_r attributes...")
+            for i in tqdm(range(len(save_dict['rotation_r_code'])), desc="Decompressing Rotation_r"):
+                labels = huffman_decode(save_dict['rotation_r_index'][i], save_dict['rotation_r_htable'][i], count=num_gaussians)
                 cluster_centers = save_dict['rotation_r_code'][i]
                 rotation_r.append(torch.tensor(cluster_centers[labels]).cuda())
             self._rotation_r = torch.cat(rotation_r, dim=-1).float()
 
-
+            print("[INFO] Decompressing MLP and time parameters...")
 
             if not hasattr(self, "mlp_cont"):
                 self.construct_net(train=True)
@@ -1266,4 +1365,5 @@ class GaussianModel:
 
             N = app_feature.shape[0]
             self._features_static = nn.Parameter(app_feature[:, 0:3].clone().detach().cuda().requires_grad_(True))  # [N, 3]
-            self._features_view = nn.Parameter(app_feature[:, 3:6].clone().detach().cuda().requires_grad_(True))  
+            self._features_view = nn.Parameter(app_feature[:, 3:6].clone().detach().cuda().requires_grad_(True))
+  

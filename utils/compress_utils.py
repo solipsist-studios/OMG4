@@ -10,10 +10,12 @@ def huffman_encode(data):
     huffman_table = codec.get_code_table()
     return encoded_bytes, huffman_table
 
-def huffman_decode(encoded_bytes, huffman_table):
+def huffman_decode(encoded_bytes, huffman_table, count=None):
     codec = dahuffman.HuffmanCodec(code_table=huffman_table)
     decoded_data = codec.decode(encoded_bytes)
-    return np.array(decoded_data, dtype=np.uint16)
+    if count is not None:
+        return np.fromiter(decoded_data, dtype=np.uint16, count=count)
+    return np.array(list(decoded_data), dtype=np.uint16)
 
 def save_comp(filename, save_dict):
     with lzma.open(filename, "wb") as f:
