@@ -65,7 +65,9 @@ def test_comp(dataset, opt, pipe, gaussian_dim, time_duration, num_pts, num_pts_
     print(xz_path)
 
     with lzma.open(xz_path, "rb") as f:
+        print(f"[INFO] Loading checkpoint {xz_path}...")
         load_dict = pickle.load(f)
+    print(f"[INFO] Checkpoint loaded. Decoding gaussians...")
     gaussians.decode(load_dict, decompress=True)
     gaussians.active_sh_degree = 3
     gaussians.active_sh_degree_t = 2
@@ -79,7 +81,8 @@ def test_comp(dataset, opt, pipe, gaussian_dim, time_duration, num_pts, num_pts_
     import time
     secs = 0.0
     pipe.env_map_res = 0
-    for idx in range(len(test_dataset)):
+    print(f"Rendering {len(test_dataset)} test frames...")
+    for idx in tqdm(range(len(test_dataset)), desc="Rendering"):
         gt_image, viewpoint_cam = test_dataset[idx]
         gt_image = gt_image.cuda()
         viewpoint = viewpoint_cam.cuda()
