@@ -76,7 +76,9 @@ namespace FORWARD
 		const float* bg_color,
 		float* out_color,
 		float* out_flow,
-		float* out_depth);
+		float* out_depth,
+		bool compute_accum,
+		bool with_flow);
 }
 
 

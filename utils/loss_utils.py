@@ -31,13 +31,22 @@ def create_window(window_size, channel):
     window = Variable(_2D_window.expand(channel, 1, window_size, window_size).contiguous())
     return window
 
+_WINDOW_CACHE = {}
+
+def _cached_window(window_size, channel, device, dtype):
+    # The 11x11 gaussian window was rebuilt on the CPU and re-uploaded on
+    # every call; it is a constant, so build it once per (size, channel,
+    # device, dtype).
+    key = (window_size, channel, str(device), dtype)
+    window = _WINDOW_CACHE.get(key)
+    if window is None:
+        window = create_window(window_size, channel).to(device=device, dtype=dtype)
+        _WINDOW_CACHE[key] = window
+    return window
+
 def ssim(img1, img2, window_size=11, size_average=True):
     channel = img1.size(-3)
-    window = create_window(window_size, channel)
-
-    if img1.is_cuda:
-        window = window.cuda(img1.get_device())
-    window = window.type_as(img1)
+    window = _cached_window(window_size, channel, img1.device, img1.dtype)
 
     return _ssim(img1, img2, window, window_size, channel, size_average)
 

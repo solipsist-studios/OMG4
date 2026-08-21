@@ -278,16 +278,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 loss_dict["Ldepth"] = last_Ldepth
 
             with torch.no_grad():
-                psnr_for_log = psnr(image, gt_image).mean().double()
-                # Progress bar
-                ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-                ema_l1loss_for_log = 0.4 * Ll1.item() + 0.6 * ema_l1loss_for_log
-                ema_ssimloss_for_log = 0.4 * Lssim.item() + 0.6 * ema_ssimloss_for_log
+                # Host-side reads (.item(), psnr) each force a CUDA sync. Only
+                # take them on logging iterations; the EMA is a display value.
+                log_iter = (iteration % 10 == 0) or tb_writer is not None
+                if log_iter:
+                    psnr_for_log = psnr(image, gt_image).mean().double()
+                    # Progress bar
+                    ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+                    ema_l1loss_for_log = 0.4 * Ll1.item() + 0.6 * ema_l1loss_for_log
+                    ema_ssimloss_for_log = 0.4 * Lssim.item() + 0.6 * ema_ssimloss_for_log
                 
                 for lambda_name in lambda_all:
                     if opt.__dict__[lambda_name] > 0:
-                        ema = vars()[f"ema_{lambda_name.replace('lambda_', '')}_for_log"]
-                        vars()[f"ema_{lambda_name.replace('lambda_', '')}_for_log"] = 0.4 * vars()[f"L{lambda_name.replace('lambda_', '')}"].item() + 0.6*ema
+                        if log_iter:
+                            ema = vars()[f"ema_{lambda_name.replace('lambda_', '')}_for_log"]
+                            vars()[f"ema_{lambda_name.replace('lambda_', '')}_for_log"] = 0.4 * vars()[f"L{lambda_name.replace('lambda_', '')}"].item() + 0.6*ema
                         loss_dict[lambda_name.replace("lambda_", "L")] = vars()[lambda_name.replace("lambda_", "L")]
                         
                 if iteration % 10 == 0:
@@ -307,7 +312,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     progress_bar.close()
 
                 # Log and save
-                test_psnr = training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_dict)
+                # elapsed_time() syncs on the events; only needed for tensorboard.
+                elapsed = iter_start.elapsed_time(iter_end) if tb_writer else 0.0
+                test_psnr = training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene, render, (pipe, background), loss_dict)
                 if (iteration in testing_iterations):
                     if test_psnr >= best_psnr:
                         best_psnr = test_psnr
@@ -432,15 +439,24 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 if config['name'] == 'test':
                     psnr_test_iter = psnr_test.item()
                     
-    torch.cuda.empty_cache()
+        # Only drain the caching allocator after a test pass allocated a
+        # burst of render buffers; per-iteration draining forces a sync and
+        # re-allocation every step.
+        torch.cuda.empty_cache()
     return psnr_test_iter
 
-def setup_seed(seed):
+def setup_seed(seed, deterministic=False):
      torch.manual_seed(seed)
      torch.cuda.manual_seed_all(seed)
      np.random.seed(seed)
      random.seed(seed)
-     torch.backends.cudnn.deterministic = True
+     # The rasterizer is a custom CUDA kernel; TF32 and cudnn autotuning only
+     # touch the SSIM convolutions and the small MLP paths. Deterministic
+     # cudnn is opt-in (--deterministic) because it pins slower conv kernels.
+     torch.backends.cudnn.deterministic = deterministic
+     torch.backends.cudnn.benchmark = not deterministic
+     torch.backends.cuda.matmul.allow_tf32 = True
+     torch.backends.cudnn.allow_tf32 = True
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -465,6 +481,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--seed", type=int, default=6666)
     parser.add_argument("--exhaust_test", action="store_true")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="Force deterministic cudnn kernels (slower); off by default.")
     
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -483,7 +501,7 @@ if __name__ == "__main__":
     if args.exhaust_test:
         args.test_iterations = args.test_iterations + [i for i in range(0,op.iterations,500)]
     
-    setup_seed(args.seed)
+    setup_seed(args.seed, deterministic=args.deterministic)
     
     print("Optimizing " + args.model_path)
 

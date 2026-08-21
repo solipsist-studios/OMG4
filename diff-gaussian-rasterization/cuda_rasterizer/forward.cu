@@ -496,7 +496,11 @@ __global__ void preprocessCUDA(int P, int D, int D_t, int M,
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
 // and rasterizing data.
-template <uint32_t CHANNELS>
+// ACCUM: accumulate per-gaussian weight statistics (SPM's SD score). Each
+// enabled contribution costs two global atomics in the inner loop, so the
+// pretrain runs with ACCUM=false. FLOW: carry the optional 2-channel flow
+// output; off unless a caller provides flows.
+template <uint32_t CHANNELS, bool ACCUM, bool FLOW>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
@@ -613,22 +617,27 @@ renderCUDA(
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++)
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
-			for (int ch = 0; ch < 2; ch++)
-				Flow[ch] += flows[collected_id[j] * 2 + ch] * alpha * T;
+			if constexpr (FLOW)
+			{
+				for (int ch = 0; ch < 2; ch++)
+					Flow[ch] += flows[collected_id[j] * 2 + ch] * alpha * T;
+			}
 			D += depths[collected_id[j]] * alpha * T;
 
 			//OMG
-			if(weight_max<alpha * T)
+			if constexpr (ACCUM)
 			{
-				weight_max=alpha * T;
-				idx_max = collected_id[j];
-				flag_update = 1;
+				if(weight_max<alpha * T)
+				{
+					weight_max=alpha * T;
+					idx_max = collected_id[j];
+					flag_update = 1;
+				}
+
+				sum_W += alpha * T;
+				atomicAdd(&(accum_weights_p[collected_id[j]]), alpha * T);
+				atomicAdd(&(accum_weights_count[collected_id[j]]), 1);
 			}
-
-
-			sum_W += alpha * T;
-			atomicAdd(&(accum_weights_p[collected_id[j]]), alpha * T);
-			atomicAdd(&(accum_weights_count[collected_id[j]]), 1);
 			///
 
 
@@ -641,9 +650,12 @@ renderCUDA(
 		}
 	}
 
-	if(flag_update==1) //flag?
+	if constexpr (ACCUM)
 	{
-		atomicAdd(&(accum_max_count[idx_max]), 1);
+		if(flag_update==1) //flag?
+		{
+			atomicAdd(&(accum_max_count[idx_max]), 1);
+		}
 	}
 	// All threads that treat valid pixel write out their final
 	// rendering data to the frame and auxiliary buffers.
@@ -653,8 +665,11 @@ renderCUDA(
 		n_contrib[pix_id] = last_contributor;
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
-		for (int ch = 0; ch < 2; ch++)
-			out_flow[ch * H * W + pix_id] = Flow[ch];
+		if constexpr (FLOW)
+		{
+			for (int ch = 0; ch < 2; ch++)
+				out_flow[ch * H * W + pix_id] = Flow[ch];
+		}
 		out_depth[pix_id] = D;
 	}
 }
@@ -681,9 +696,12 @@ void FORWARD::render(
 	const float* bg_color,
 	float* out_color,
 	float* out_flow,
-	float* out_depth)
+	float* out_depth,
+	bool compute_accum,
+	bool with_flow)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
+	auto launch = [&](auto kernel) {
+		kernel << <grid, block >> > (
 		ranges,
 		point_list,
 		W, H,
@@ -706,6 +724,11 @@ void FORWARD::render(
 		out_color,
 		out_flow,
 		out_depth);
+	};
+	if (compute_accum && with_flow)       launch(renderCUDA<NUM_CHANNELS, true, true>);
+	else if (compute_accum)               launch(renderCUDA<NUM_CHANNELS, true, false>);
+	else if (with_flow)                   launch(renderCUDA<NUM_CHANNELS, false, true>);
+	else                                  launch(renderCUDA<NUM_CHANNELS, false, false>);
 }
 
 void FORWARD::preprocess(int P, int D, int D_t, int M,

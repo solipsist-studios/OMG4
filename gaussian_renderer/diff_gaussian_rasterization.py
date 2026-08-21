@@ -18,7 +18,7 @@ from torch.utils.cpp_extension import load
 parent_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "diff-gaussian-rasterization")
 _C = load(
     name='diff_gaussian_rasterization',
-    extra_cuda_cflags=["-I " + os.path.join(parent_dir, "third_party/glm/"), "-g"],
+    extra_cuda_cflags=["-I " + os.path.join(parent_dir, "third_party/glm/"), "-O3", "--use_fast_math"],
     sources=[
         os.path.join(parent_dir, "cuda_rasterizer/rasterizer_impl.cu"),
         os.path.join(parent_dir, "cuda_rasterizer/forward.cu"),
@@ -112,6 +112,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             raster_settings.force_sh_3d,
             raster_settings.prefiltered,
             raster_settings.debug,
+            raster_settings.compute_accum,
         )
         # import pickle
         # f = open("/hdd/lms20031/pruning/tmp.pkl", "rb")
@@ -150,7 +151,11 @@ class _RasterizeGaussians(torch.autograd.Function):
                                 flow_2d, opacities, ts, scales_t, rotations_r,
                                 geomBuffer, binningBuffer, imgBuffer)
 
-        return color, radii, depth, 1-T, flow, covs_com, accum_weights_ptr, accum_weights_count, accum_max_count
+        # Empty tensors mean the corresponding work was templated out
+        # (flow_2d empty, or compute_accum False); hand back None.
+        none_if_empty = lambda t: None if t.numel() == 0 else t
+        return color, radii, depth, 1-T, none_if_empty(flow), covs_com, \
+            none_if_empty(accum_weights_ptr), none_if_empty(accum_weights_count), none_if_empty(accum_max_count)
 
     @staticmethod
     def backward(ctx, grad_out_color, grad_radii, grad_depth, grad_alpha, grad_flow, grad_covs_com, a, b, c):
@@ -162,6 +167,9 @@ class _RasterizeGaussians(torch.autograd.Function):
          flow_2d, opacities, ts, scales_t, rotations_r,
          geomBuffer, binningBuffer, imgBuffer) = ctx.saved_tensors
         
+        if grad_flow is None:
+            grad_flow = torch.empty(0, device=means3D.device, dtype=means3D.dtype)
+
         # Restructure args as C++ method expects them
         args = (raster_settings.bg,
                 means3D, 
@@ -221,7 +229,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             grad_means2D,
             grad_sh,
             grad_colors_precomp,
-            grad_flows,
+            grad_flows if grad_flows.numel() > 0 else None,
             grad_opacities,
             grad_ts,
             grad_scales,
@@ -253,6 +261,10 @@ class GaussianRasterizationSettings(NamedTuple):
     force_sh_3d: bool
     prefiltered : bool
     debug : bool
+    # Accumulate per-gaussian weight statistics (accum_weights / area_proj /
+    # area_max, used by the SPM SD score). Costs two global atomics per
+    # pixel-gaussian contribution, so off for ordinary training.
+    compute_accum : bool = False
 
 class GaussianRasterizer(nn.Module):
     def __init__(self, raster_settings):
