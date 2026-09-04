@@ -11,6 +11,18 @@
 
 import os
 import random
+
+# Local patch: service managers (systemd) default the soft fd limit to 1024,
+# and torch's DataLoader shares every batch tensor through an fd-backed shm
+# object -- 8 workers x prefetch 4 exhausts 1024 mid-epoch ("Too many open
+# files", or a silently dying worker). A process may raise its own soft limit
+# to the hard limit without privileges, so do that before torch loads.
+import resource
+
+_soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+if _soft < _hard:
+    resource.setrlimit(resource.RLIMIT_NOFILE, (_hard, _hard))
+
 import torch
 from torch import nn
 from utils.loss_utils import l1_loss, ssim, msssim
@@ -86,6 +98,10 @@ def depth_prior_loss(render_depth, alpha, image_path):
     return 1.0 - (x * y).sum() / denom
 
 
+def _identity_collate(batch):
+    return batch
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint, debug_from,
              gaussian_dim, time_duration, num_pts, num_pts_ratio, rot_4d, force_sh_3d, batch_size):
     
@@ -134,12 +150,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians.env_map = env_map
         
     training_dataset = scene.getTrainCameras()
-    # num_workers>0 requires data_device: "cpu" (forked workers must not touch CUDA;
+    # num_workers>0 requires data_device: "cpu" (workers must not touch CUDA;
     # the loop below already moves each batch item to GPU via .cuda()). With
     # data_device: "cuda" the cameras hold CUDA tensors and workers would crash.
+    # Local patch: workers use the 'spawn' context, not fork. Forking a
+    # CUDA-initialized, multi-threaded parent is undefined behaviour and on
+    # python 3.13 it segfaulted a worker mid-epoch (EOFError in recvfds).
+    # Spawn needs a picklable collate_fn, hence the named identity function.
+    # GS4D_NUM_WORKERS=0 is the bulletproof fallback; GS4D_WORKER_CONTEXT=fork
+    # restores the old behaviour.
     _nw = 8 if str(getattr(dataset, 'data_device', 'cuda')) == 'cpu' else 0
-    training_dataloader = DataLoader(training_dataset, batch_size=batch_size, shuffle=True, num_workers=_nw, collate_fn=lambda x: x, drop_last=True,
-                                     persistent_workers=(_nw > 0), prefetch_factor=(4 if _nw > 0 else None))
+    _nw = int(os.environ.get('GS4D_NUM_WORKERS', _nw))
+    _ctx = os.environ.get('GS4D_WORKER_CONTEXT', 'spawn') if _nw > 0 else None
+    training_dataloader = DataLoader(training_dataset, batch_size=batch_size, shuffle=True, num_workers=_nw, collate_fn=_identity_collate, drop_last=True,
+                                     persistent_workers=(_nw > 0), prefetch_factor=(4 if _nw > 0 else None),
+                                     multiprocessing_context=_ctx)
      
     iteration = first_iter
     while iteration < opt.iterations + 1:
