@@ -18,7 +18,7 @@ from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
-from utils.data_utils import CameraDataset
+from utils.data_utils import CameraDataset, build_image_cache
 
 class Scene:
 
@@ -45,6 +45,8 @@ class Scene:
 
         self.train_cameras = {}
         self.test_cameras = {}
+        self._train_image_cache = {}
+        self.cache_images = getattr(args, "cache_images", False)
 
         if os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, num_pts_ratio=num_pts_ratio, time_duration=time_duration, img_per_vid=args.img_per_vid, test_only=test_only, dense_frame="")#args.dense_frame)
@@ -101,7 +103,12 @@ class Scene:
             torch.save((self.gaussians.capture_svq(), iteration), self.model_path + "/chkpnt" + str(iteration) + ".pth")
 
     def getTrainCameras(self, scale=1.0):
-        return CameraDataset(self.train_cameras[scale].copy(), self.white_background)
+        cache = None
+        if self.cache_images:
+            if scale not in self._train_image_cache:
+                self._train_image_cache[scale] = build_image_cache(self.train_cameras[scale], self.white_background)
+            cache = self._train_image_cache[scale]
+        return CameraDataset(self.train_cameras[scale].copy(), self.white_background, image_cache=cache)
         
     def getTestCameras(self, scale=1.0):
         return CameraDataset(self.test_cameras[scale].copy(), self.white_background)

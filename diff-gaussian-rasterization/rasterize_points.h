@@ -45,7 +45,8 @@ RasterizeGaussiansCUDA(
 	const int gaussian_dim,
 	const bool force_sh_3d,
 	const bool prefiltered,
-	const bool debug);
+	const bool debug,
+	const bool compute_accum);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(

@@ -28,7 +28,7 @@ def norm_weights(logits, group_ids, G):
     return raw / denom[group_ids]
 
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, compute_accum = False):
     """
     Render the scene. 
     
@@ -64,7 +64,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         gaussian_dim=pc.gaussian_dim,
         force_sh_3d=pc.force_sh_3d,
         prefiltered=False,
-        debug=pipe.debug
+        debug=pipe.debug,
+        compute_accum=compute_accum,
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -126,7 +127,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     else:
         colors_precomp = override_color
     
-    flow_2d = torch.zeros_like(pc.get_xyz[:,:2])
+    # No flow supervision exists in this trainer; an empty tensor tells the
+    # rasterizer to template the two flow channels (and their backward
+    # atomics) out entirely. Pass a (P, 2) tensor to turn them back on.
+    flow_2d = torch.empty(0, device=pc.get_xyz.device, dtype=pc.get_xyz.dtype)
 
     
     # AC - network
@@ -239,7 +243,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             ts = new_ts[keep]
 
         means2D = torch.zeros_like(means3D, dtype=means3D.dtype, requires_grad=True, device="cuda") + 0
-        flow_2d = torch.zeros_like(means3D[:,:2], device="cuda")
+        flow_2d = torch.empty(0, device="cuda")
 
 
     ####
@@ -268,7 +272,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             rotations_r = rotations_r[mask]
         if cov3D_precomp is not None:
             cov3D_precomp = cov3D_precomp[mask]
-        if flow_2d is not None:
+        if flow_2d is not None and flow_2d.numel() > 0:
             flow_2d = flow_2d[mask]
 
 

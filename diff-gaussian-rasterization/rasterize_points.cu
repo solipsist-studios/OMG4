@@ -33,6 +33,13 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
     return lambda;
 }
 
+// Empty tensors cross the boundary as nullptr so the rasterizer can skip the
+// matching (templated-out) work: flow channels when `flows` is empty, the SPM
+// accumulation buffers when `compute_accum` is false.
+static float* optional_fptr(const torch::Tensor& t) {
+  return t.numel() == 0 ? nullptr : t.contiguous().data_ptr<float>();
+}
+
 std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
@@ -63,7 +70,8 @@ RasterizeGaussiansCUDA(
 	const int gaussian_dim,
 	const bool force_sh_3d,
 	const bool prefiltered,
-	const bool debug)
+	const bool debug,
+	const bool compute_accum)
 {
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
     AT_ERROR("means3D must have dimensions (num_points, 3)");
@@ -77,16 +85,17 @@ RasterizeGaussiansCUDA(
   auto float_opts = means3D.options().dtype(torch::kFloat32);
 
   torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
-  torch::Tensor out_flow = torch::full({2, H, W}, 0.0, float_opts);
+  const bool with_flow = flows.numel() > 0;
+  torch::Tensor out_flow = with_flow ? torch::full({2, H, W}, 0.0, float_opts) : torch::empty({0}, float_opts);
   torch::Tensor out_depth = torch::full({1, H, W}, 0.0, float_opts);
   torch::Tensor out_T = torch::full({1, H, W}, 0.0, float_opts);
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
   torch::Tensor out_means3D = means3D.clone();
 
   // OMG
-  torch::Tensor accum_weights_ptr = torch::full({P}, 0, float_opts);
-  torch::Tensor accum_weights_count = torch::full({P}, 0, int_opts);
-  torch::Tensor accum_max_count = torch::full({P}, 0, float_opts);
+  torch::Tensor accum_weights_ptr = compute_accum ? torch::full({P}, 0, float_opts) : torch::empty({0}, float_opts);
+  torch::Tensor accum_weights_count = compute_accum ? torch::full({P}, 0, int_opts) : torch::empty({0}, int_opts);
+  torch::Tensor accum_max_count = compute_accum ? torch::full({P}, 0, float_opts) : torch::empty({0}, float_opts);
   //
   
   torch::Device device(torch::kCUDA);
@@ -118,7 +127,7 @@ RasterizeGaussiansCUDA(
 		out_means3D.contiguous().data<float>(),
 		sh.contiguous().data_ptr<float>(),
 		colors.contiguous().data<float>(), 
-		flows.contiguous().data<float>(),
+		optional_fptr(flows),
 		opacity.contiguous().data<float>(), 
 		ts.contiguous().data_ptr<float>(), 
 		scales.contiguous().data_ptr<float>(),
@@ -139,15 +148,15 @@ RasterizeGaussiansCUDA(
 		tan_fovy,
 		prefiltered,
 		out_color.contiguous().data<float>(),
-		out_flow.contiguous().data<float>(), 
+		optional_fptr(out_flow), 
 		out_depth.contiguous().data<float>(),
 		out_T.contiguous().data<float>(),
 
 		
 		// OMG accum_weights 추가
-		accum_weights_ptr.contiguous().data<float>(),  
-		accum_weights_count.contiguous().data<int>(),  
-		accum_max_count.contiguous().data<float>(),  
+		optional_fptr(accum_weights_ptr),  
+		compute_accum ? accum_weights_count.contiguous().data_ptr<int>() : nullptr,  
+		optional_fptr(accum_max_count),  
   
 
 
@@ -215,7 +224,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   torch::Tensor dL_dmeans3D = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_dmeans2D = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_dcolors = torch::zeros({P, NUM_CHANNELS}, means3D.options());
-  torch::Tensor dL_dflows = torch::zeros({P, 2}, means3D.options());
+  const bool with_flow = flows_2d.numel() > 0;
+  torch::Tensor dL_dflows = with_flow ? torch::zeros({P, 2}, means3D.options()) : torch::empty({0}, means3D.options());
   torch::Tensor dL_dconic = torch::zeros({P, 2, 2}, means3D.options());
   torch::Tensor dL_dopacity = torch::zeros({P, 1}, means3D.options());
   torch::Tensor dL_dts = torch::zeros({P, 1}, means3D.options());
@@ -235,7 +245,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  out_means3D.contiguous().data<float>(),
 	  sh.contiguous().data<float>(),
 	  colors.contiguous().data<float>(),
-	  flows_2d.contiguous().data<float>(),
+	  optional_fptr(flows_2d),
 	  opacities.contiguous().data<float>(),
 	  ts.contiguous().data<float>(),
 	  scales.data_ptr<float>(),
@@ -261,7 +271,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  dL_dout_color.contiguous().data<float>(),
 	  dL_dout_depth.contiguous().data<float>(),
 	  dL_dout_mask.contiguous().data<float>(),
-	  dL_dout_flow.contiguous().data<float>(),
+	  with_flow ? dL_dout_flow.contiguous().data<float>() : nullptr,
 	  dL_dmeans2D.contiguous().data<float>(),
 	  dL_dconic.contiguous().data<float>(),  
 	  dL_dopacity.contiguous().data<float>(),
@@ -269,7 +279,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  dL_dmeans3D.contiguous().data<float>(),
 	  dL_dcov3D.contiguous().data<float>(),
 	  dL_dsh.contiguous().data<float>(),
-	  dL_dflows.contiguous().data<float>(),
+	  optional_fptr(dL_dflows),
 	  dL_dts.contiguous().data<float>(),
 	  dL_dscales.contiguous().data<float>(),
 	  dL_dscales_t.contiguous().data<float>(),

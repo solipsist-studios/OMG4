@@ -921,7 +921,8 @@ __global__ void preprocessCUDA(
 }
 
 // Backward version of the rendering procedure.
-template <uint32_t C>
+// FLOW: see forward.cu; off unless flows are supplied.
+template <uint32_t C, bool FLOW>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
@@ -991,8 +992,11 @@ renderCUDA(
 		for (int i = 0; i < C; i++){
 			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
 		}
-		for (int i = 0; i < 2; i++){
-			dL_dflow[i] = dL_dpix_flow[i * H * W + pix_id];
+		if constexpr (FLOW)
+		{
+			for (int i = 0; i < 2; i++){
+				dL_dflow[i] = dL_dpix_flow[i * H * W + pix_id];
+			}
 		}
 		dL_depth = dL_depths[pix_id];
 		dL_mask = dL_masks[pix_id];
@@ -1024,8 +1028,11 @@ renderCUDA(
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 			for (int i = 0; i < C; i++)
 				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
-			for (int i = 0; i < 2; i++)
-				collected_flows[i * BLOCK_SIZE + block.thread_rank()] = flows_2d[coll_id * 2 + i];
+			if constexpr (FLOW)
+			{
+				for (int i = 0; i < 2; i++)
+					collected_flows[i * BLOCK_SIZE + block.thread_rank()] = flows_2d[coll_id * 2 + i];
+			}
 		}
 		block.sync();
 
@@ -1074,19 +1081,22 @@ renderCUDA(
 				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
 			}
 
-			for (int ch = 0; ch < 2; ch++)
+			if constexpr (FLOW)
 			{
-				const float flow = collected_flows[ch * BLOCK_SIZE + j];
-				// Update last color (to be used in the next iteration)
-				accum_flow_rec[ch] = last_alpha * last_flow[ch] + (1.f - last_alpha) * accum_flow_rec[ch];
-				last_flow[ch] = flow;
+				for (int ch = 0; ch < 2; ch++)
+				{
+					const float flow = collected_flows[ch * BLOCK_SIZE + j];
+					// Update last color (to be used in the next iteration)
+					accum_flow_rec[ch] = last_alpha * last_flow[ch] + (1.f - last_alpha) * accum_flow_rec[ch];
+					last_flow[ch] = flow;
 
-				const float dL_dchannelflow = dL_dflow[ch];
-				dL_dalpha += (flow - accum_flow_rec[ch]) * dL_dchannelflow;
-				// Update the gradients w.r.t. color of the Gaussian.
-				// Atomic, since this pixel is just one of potentially
-				// many that were affected by this Gaussian.
-				atomicAdd(&(dL_dflows[global_id * 2 + ch]), dchannel_dcolor * dL_dchannelflow);
+					const float dL_dchannelflow = dL_dflow[ch];
+					dL_dalpha += (flow - accum_flow_rec[ch]) * dL_dchannelflow;
+					// Update the gradients w.r.t. color of the Gaussian.
+					// Atomic, since this pixel is just one of potentially
+					// many that were affected by this Gaussian.
+					atomicAdd(&(dL_dflows[global_id * 2 + ch]), dchannel_dcolor * dL_dchannelflow);
+				}
 			}
 
 			// Propagate gradients to per-Gaussian depths
@@ -1245,9 +1255,11 @@ void BACKWARD::render(
 	float4* dL_dconic2D,
 	float* dL_dopacity,
 	float* dL_dcolors,
-	float* dL_dflows)
+	float* dL_dflows,
+	bool with_flow)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
+	auto launch = [&](auto kernel) {
+		kernel << <grid, block >> >(
 		ranges,
 		point_list,
 		W, H,
@@ -1269,4 +1281,7 @@ void BACKWARD::render(
 		dL_dcolors,
 		dL_dflows
 		);
+	};
+	if (with_flow) launch(renderCUDA<NUM_CHANNELS, true>);
+	else           launch(renderCUDA<NUM_CHANNELS, false>);
 }

@@ -11,6 +11,18 @@
 
 import os
 import random
+
+# Local patch: service managers (systemd) default the soft fd limit to 1024,
+# and torch's DataLoader shares every batch tensor through an fd-backed shm
+# object -- 8 workers x prefetch 4 exhausts 1024 mid-epoch ("Too many open
+# files", or a silently dying worker). A process may raise its own soft limit
+# to the hard limit without privileges, so do that before torch loads.
+import resource
+
+_soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+if _soft < _hard:
+    resource.setrlimit(resource.RLIMIT_NOFILE, (_hard, _hard))
+
 import torch
 from torch import nn
 from utils.loss_utils import l1_loss, ssim, msssim
@@ -86,6 +98,10 @@ def depth_prior_loss(render_depth, alpha, image_path):
     return 1.0 - (x * y).sum() / denom
 
 
+def _identity_collate(batch):
+    return batch
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint, debug_from,
              gaussian_dim, time_duration, num_pts, num_pts_ratio, rot_4d, force_sh_3d, batch_size):
     
@@ -134,12 +150,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     gaussians.env_map = env_map
         
     training_dataset = scene.getTrainCameras()
-    # num_workers>0 requires data_device: "cpu" (forked workers must not touch CUDA;
+    # num_workers>0 requires data_device: "cpu" (workers must not touch CUDA;
     # the loop below already moves each batch item to GPU via .cuda()). With
     # data_device: "cuda" the cameras hold CUDA tensors and workers would crash.
+    # Local patch: workers use the 'spawn' context, not fork. Forking a
+    # CUDA-initialized, multi-threaded parent is undefined behaviour and on
+    # python 3.13 it segfaulted a worker mid-epoch (EOFError in recvfds).
+    # Spawn needs a picklable collate_fn, hence the named identity function.
+    # GS4D_NUM_WORKERS=0 is the bulletproof fallback; GS4D_WORKER_CONTEXT=fork
+    # restores the old behaviour.
     _nw = 8 if str(getattr(dataset, 'data_device', 'cuda')) == 'cpu' else 0
-    training_dataloader = DataLoader(training_dataset, batch_size=batch_size, shuffle=True, num_workers=_nw, collate_fn=lambda x: x, drop_last=True,
-                                     persistent_workers=(_nw > 0), prefetch_factor=(4 if _nw > 0 else None))
+    _nw = int(os.environ.get('GS4D_NUM_WORKERS', _nw))
+    _ctx = os.environ.get('GS4D_WORKER_CONTEXT', 'spawn') if _nw > 0 else None
+    training_dataloader = DataLoader(training_dataset, batch_size=batch_size, shuffle=True, num_workers=_nw, collate_fn=_identity_collate, drop_last=True,
+                                     persistent_workers=(_nw > 0), prefetch_factor=(4 if _nw > 0 else None),
+                                     multiprocessing_context=_ctx)
      
     iteration = first_iter
     while iteration < opt.iterations + 1:
@@ -278,16 +303,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 loss_dict["Ldepth"] = last_Ldepth
 
             with torch.no_grad():
-                psnr_for_log = psnr(image, gt_image).mean().double()
-                # Progress bar
-                ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-                ema_l1loss_for_log = 0.4 * Ll1.item() + 0.6 * ema_l1loss_for_log
-                ema_ssimloss_for_log = 0.4 * Lssim.item() + 0.6 * ema_ssimloss_for_log
+                # Host-side reads (.item(), psnr) each force a CUDA sync. Only
+                # take them on logging iterations; the EMA is a display value.
+                log_iter = (iteration % 10 == 0) or tb_writer is not None
+                if log_iter:
+                    psnr_for_log = psnr(image, gt_image).mean().double()
+                    # Progress bar
+                    ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+                    ema_l1loss_for_log = 0.4 * Ll1.item() + 0.6 * ema_l1loss_for_log
+                    ema_ssimloss_for_log = 0.4 * Lssim.item() + 0.6 * ema_ssimloss_for_log
                 
                 for lambda_name in lambda_all:
                     if opt.__dict__[lambda_name] > 0:
-                        ema = vars()[f"ema_{lambda_name.replace('lambda_', '')}_for_log"]
-                        vars()[f"ema_{lambda_name.replace('lambda_', '')}_for_log"] = 0.4 * vars()[f"L{lambda_name.replace('lambda_', '')}"].item() + 0.6*ema
+                        if log_iter:
+                            ema = vars()[f"ema_{lambda_name.replace('lambda_', '')}_for_log"]
+                            vars()[f"ema_{lambda_name.replace('lambda_', '')}_for_log"] = 0.4 * vars()[f"L{lambda_name.replace('lambda_', '')}"].item() + 0.6*ema
                         loss_dict[lambda_name.replace("lambda_", "L")] = vars()[lambda_name.replace("lambda_", "L")]
                         
                 if iteration % 10 == 0:
@@ -307,7 +337,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     progress_bar.close()
 
                 # Log and save
-                test_psnr = training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_dict)
+                # elapsed_time() syncs on the events; only needed for tensorboard.
+                elapsed = iter_start.elapsed_time(iter_end) if tb_writer else 0.0
+                test_psnr = training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene, render, (pipe, background), loss_dict)
                 if (iteration in testing_iterations):
                     if test_psnr >= best_psnr:
                         best_psnr = test_psnr
@@ -432,15 +464,24 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 if config['name'] == 'test':
                     psnr_test_iter = psnr_test.item()
                     
-    torch.cuda.empty_cache()
+        # Only drain the caching allocator after a test pass allocated a
+        # burst of render buffers; per-iteration draining forces a sync and
+        # re-allocation every step.
+        torch.cuda.empty_cache()
     return psnr_test_iter
 
-def setup_seed(seed):
+def setup_seed(seed, deterministic=False):
      torch.manual_seed(seed)
      torch.cuda.manual_seed_all(seed)
      np.random.seed(seed)
      random.seed(seed)
-     torch.backends.cudnn.deterministic = True
+     # The rasterizer is a custom CUDA kernel; TF32 and cudnn autotuning only
+     # touch the SSIM convolutions and the small MLP paths. Deterministic
+     # cudnn is opt-in (--deterministic) because it pins slower conv kernels.
+     torch.backends.cudnn.deterministic = deterministic
+     torch.backends.cudnn.benchmark = not deterministic
+     torch.backends.cuda.matmul.allow_tf32 = True
+     torch.backends.cudnn.allow_tf32 = True
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -465,6 +506,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--seed", type=int, default=6666)
     parser.add_argument("--exhaust_test", action="store_true")
+    parser.add_argument("--deterministic", action="store_true",
+                        help="Force deterministic cudnn kernels (slower); off by default.")
     
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
@@ -483,7 +526,7 @@ if __name__ == "__main__":
     if args.exhaust_test:
         args.test_iterations = args.test_iterations + [i for i in range(0,op.iterations,500)]
     
-    setup_seed(args.seed)
+    setup_seed(args.seed, deterministic=args.deterministic)
     
     print("Optimizing " + args.model_path)
 

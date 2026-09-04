@@ -59,6 +59,10 @@ class ModelParams(ParamGroup):
         self.loaded_pth = ""
         self.frame_ratio = 1
         self.dataloader = False
+        # Decode every training view once into shared memory instead of
+        # re-reading PNGs in every DataLoader worker on every epoch. Falls
+        # back automatically when RAM is short (see build_image_cache).
+        self.cache_images = True
         self.img_per_vid = None
         self.data = None
         super().__init__(parser, "Loading Parameters", sentinel)

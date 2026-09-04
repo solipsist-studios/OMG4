@@ -369,7 +369,9 @@ int CudaRasterizer::Rasterizer::forward(
 		background,
 		out_color,
 		out_flow,
-		out_depth), debug)
+		out_depth,
+		/*compute_accum=*/accum_weights_ptr != nullptr,
+		/*with_flow=*/flow_ptr != nullptr && out_flow != nullptr), debug)
 
 	CHECK_CUDA(cudaMemcpy(out_T, imgState.accum_alpha, width * height * sizeof(float), cudaMemcpyDeviceToDevice), debug);
 	return num_rendered;
@@ -464,7 +466,8 @@ void CudaRasterizer::Rasterizer::backward(
 		(float3*)dL_dmean2D,
 		(float4*)dL_dconic,
 		dL_dopacity,
-		dL_dcolor, dL_dflows), debug)
+		dL_dcolor, dL_dflows,
+		/*with_flow=*/flows_2d != nullptr && dL_dpix_flow != nullptr), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
