@@ -1,1 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
 CLAUDE.md
+res.txt
+output/
+configs/custom/
+data/
+
+**/build/
+*.temp*
+*.egg-info
+*.linux-x86_64*
