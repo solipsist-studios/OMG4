@@ -134,6 +134,19 @@ class OptimizationParams(ParamGroup):
         # The prior's scale/shift are its own, so the loss is Pearson
         # correlation over the subject mask (scale-shift invariant). 0 = off.
         self.lambda_depth = 0.0
+        # Opacity-mask loss (see train_scratch.py): charges rendered opacity
+        # wherever the per-view silhouette mask says background, regardless
+        # of colour, so it prunes floaters of any shade -- unlike matching
+        # the training background colour to the subject, which only ever
+        # substitutes one floater colour for another. Needs gt_alpha_mask
+        # populated per view (utils/data_utils.py's CameraDataset attaches it
+        # in the args.dataloader path; it was already set for the eager
+        # path). 0 = off, preserving upstream behaviour exactly; measured
+        # production value 0.005 (a lower, metric-derived 0.002 left visible
+        # artifacts attached to the subject's silhouette, which the automated
+        # floater metrics cannot see because they merge into the subject's
+        # connected component).
+        self.lambda_opa_mask = 0.0
         self.tau_GS = 0.2
         self.tau_GP = 0.8
         # Dynamic-branch pruning cutoff. gradient_pruning keeps

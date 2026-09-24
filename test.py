@@ -83,9 +83,11 @@ def test_comp(dataset, opt, pipe, gaussian_dim, time_duration, num_pts, num_pts_
     pipe.env_map_res = 0
     print(f"Rendering {len(test_dataset)} test frames...")
     for idx in tqdm(range(len(test_dataset)), desc="Rendering"):
-        gt_image, viewpoint_cam = test_dataset[idx]
+        gt_image, gt_alpha_mask, viewpoint_cam = test_dataset[idx]
         gt_image = gt_image.cuda()
         viewpoint = viewpoint_cam.cuda()
+        if gt_alpha_mask is not None:
+            viewpoint.gt_alpha_mask = gt_alpha_mask.cuda()
 
         screenspace_points = torch.zeros_like(
             scene.gaussians.get_xyz,

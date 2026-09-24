@@ -125,7 +125,16 @@ def fetchPly(path):
     else:
         normals = np.zeros_like(positions)
     if 'time' in vertices:
-        timestamp = vertices['time'][:, None]
+        # vertices['time'] is a view into the structured ply array: its
+        # stride is the full per-vertex record size, not 4 bytes, which
+        # torch.from_numpy (used on pcd.time in gaussian_model.create_from_pcd)
+        # rejects with "strides not a multiple of the element byte size".
+        # Reading readNerfSyntheticInfo's num_pts>points.shape[0] branch masks
+        # this by re-indexing pcd.time (numpy fancy-indexing always copies to
+        # a contiguous array) before it reaches create_from_pcd, which is why
+        # this only crashes when the init cloud is <= num_pts and every larger
+        # run had it hidden.
+        timestamp = np.ascontiguousarray(vertices['time'][:, None])
     else:
         timestamp = None
     return BasicPointCloud(points=positions, colors=colors, normals=normals, time=timestamp)

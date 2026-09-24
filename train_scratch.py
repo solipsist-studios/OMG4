@@ -135,8 +135,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_l1loss_for_log = 0.0
     ema_ssimloss_for_log = 0.0
     lambda_all = [key for key in opt.__dict__.keys() if key.startswith('lambda') and key!='lambda_dssim']
-    for lambda_name in lambda_all:
-        vars()[f"ema_{lambda_name.replace('lambda_','')}_for_log"] = 0.0
+    # A real dict, not vars()[name] = value: writing a NEW key into vars()/
+    # locals() inside a function does not create an actual local variable in
+    # CPython -- only reads of names that already exist in the source reflect
+    # live values, so any lambda_* enabled here beyond ema_loss/l1loss/ssimloss
+    # above raised KeyError the first time it was ever turned on above 0
+    # (lambda_opa_mask's ema_opa_mask_for_log among them).
+    ema_extra_for_log = {lambda_name: 0.0 for lambda_name in lambda_all}
     
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -190,9 +195,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             batch_radii = []
             
             for batch_idx in range(batch_size):
-                gt_image, viewpoint_cam = batch_data[batch_idx]
+                gt_image, gt_alpha_mask, viewpoint_cam = batch_data[batch_idx]
                 gt_image = gt_image.cuda()
                 viewpoint_cam = viewpoint_cam.cuda()
+                # Set after .cuda(), not before: gt_alpha_mask is a fresh
+                # per-iteration value from the dataloader (see CameraDataset
+                # .__getitem__), not an attribute .cuda() already moved.
+                if gt_alpha_mask is not None:
+                    viewpoint_cam.gt_alpha_mask = gt_alpha_mask.cuda()
 
                 render_pkg = render(viewpoint_cam, gaussians, pipe, background)
                 image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
@@ -316,8 +326,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 for lambda_name in lambda_all:
                     if opt.__dict__[lambda_name] > 0:
                         if log_iter:
-                            ema = vars()[f"ema_{lambda_name.replace('lambda_', '')}_for_log"]
-                            vars()[f"ema_{lambda_name.replace('lambda_', '')}_for_log"] = 0.4 * vars()[f"L{lambda_name.replace('lambda_', '')}"].item() + 0.6*ema
+                            loss_key = f"L{lambda_name.replace('lambda_', '')}"
+                            ema_extra_for_log[lambda_name] = 0.4 * vars()[loss_key].item() + 0.6 * ema_extra_for_log[lambda_name]
                         loss_dict[lambda_name.replace("lambda_", "L")] = vars()[lambda_name.replace("lambda_", "L")]
                         
                 if iteration % 10 == 0:
@@ -328,8 +338,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     
                     for lambda_name in lambda_all:
                         if opt.__dict__[lambda_name] > 0:
-                            ema_loss = vars()[f"ema_{lambda_name.replace('lambda_', '')}_for_log"]
-                            postfix[lambda_name.replace("lambda_", "L")] = f"{ema_loss:.{4}f}"
+                            postfix[lambda_name.replace("lambda_", "L")] = f"{ema_extra_for_log[lambda_name]:.{4}f}"
                             
                     progress_bar.set_postfix(postfix)
                     progress_bar.update(10)
@@ -433,10 +442,12 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 ssim_test = 0.0
                 msssim_test = 0.0
                 for idx, batch_data in enumerate(tqdm(config['cameras'])):
-                    gt_image, viewpoint = batch_data
+                    gt_image, gt_alpha_mask, viewpoint = batch_data
                     gt_image = gt_image.cuda()
                     viewpoint = viewpoint.cuda()
-                    
+                    if gt_alpha_mask is not None:
+                        viewpoint.gt_alpha_mask = gt_alpha_mask.cuda()
+
                     render_pkg = renderFunc(viewpoint, scene.gaussians, *renderArgs)
                     image = torch.clamp(render_pkg["render"], 0.0, 1.0)
                     
