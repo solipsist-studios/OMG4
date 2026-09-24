@@ -9,8 +9,13 @@ import numpy as np
 
 def _composite_and_resize(image_path, resolution, bg):
     """Decode one RGBA frame, composite over `bg`, resize to `resolution`,
-    and return the uint8 HxWx3 array. This is the exact pixel chain the
-    per-sample loader used, so cached and uncached paths agree bit for bit."""
+    and return `(rgb, mask)` uint8 arrays: HxWx3 colour plus HxW silhouette
+    (the alpha channel, unpremultiplied). This is the exact pixel chain the
+    per-sample loader used, so cached and uncached paths agree bit for bit.
+
+    The mask is what lambda_opa_mask's ground truth (Camera.gt_alpha_mask)
+    is built from: the composite step above already needs the alpha channel
+    to blend onto `bg`, so returning it too costs nothing extra to decode."""
     with Image.open(image_path) as image_load:
         im_data = np.array(image_load.convert("RGBA"))
     # float32, not float64: the original chain allocated several
@@ -25,8 +30,9 @@ def _composite_and_resize(image_path, resolution, bg):
         arr = rgb * alpha + bg255 * (np.float32(1.0) - alpha)
     else:
         arr = rgb * alpha        # black background: the bg term is a no-op
-    image_load = Image.fromarray(arr.astype(np.uint8), "RGB")
-    return np.array(image_load.resize(resolution))
+    composited = Image.fromarray(arr.astype(np.uint8), "RGB").resize(resolution)
+    mask = Image.fromarray(im_data[:, :, 3], "L").resize(resolution)
+    return np.array(composited), np.array(mask)
 
 
 def _mem_available_bytes():
@@ -48,9 +54,12 @@ def _decode_job(job):
 
 def build_image_cache(viewpoint_stack, white_background, workers=None):
     """Decode every meta_only view once into a shared-memory uint8 tensor of
-    shape (N, 3, H, W). Built in the parent before DataLoader workers fork,
-    so the workers inherit one copy instead of each re-decoding PNGs for
-    the whole run (~60k decodes at 30k iterations x batch 2).
+    shape (N, 4, H, W): 3 colour channels plus the silhouette mask
+    lambda_opa_mask needs, packed together so there is one cache and one
+    decode pass rather than two. Built in the parent before DataLoader
+    workers fork, so the workers inherit one copy instead of each
+    re-decoding PNGs for the whole run (~60k decodes at 30k iterations x
+    batch 2).
 
     Returns None (and prints why) when the views differ in size or the
     cache would exceed half of the currently available RAM."""
@@ -63,22 +72,23 @@ def build_image_cache(viewpoint_stack, white_background, workers=None):
         return None
     (w, h), = sizes
     n = len(viewpoint_stack)
-    nbytes = n * 3 * h * w
+    nbytes = n * 4 * h * w
     avail = _mem_available_bytes()
     if avail is not None and nbytes > avail * 0.5:
         print(f"[image cache] skipped: {nbytes / 1e9:.1f} GB needed, "
               f"{avail / 1e9:.1f} GB available")
         return None
     bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
-    cache = torch.empty((n, 3, h, w), dtype=torch.uint8).share_memory_()
+    cache = torch.empty((n, 4, h, w), dtype=torch.uint8).share_memory_()
     jobs = [(c.image_path, tuple(c.resolution), bg) for c in viewpoint_stack]
     workers = workers or max(1, min(16, (os.cpu_count() or 2) - 2))
     print(f"[image cache] decoding {n} views at {w}x{h} ({nbytes / 1e9:.1f} GB) "
           f"with {workers} workers")
     from concurrent.futures import ProcessPoolExecutor
     with ProcessPoolExecutor(workers) as pool:
-        for i, arr in enumerate(pool.map(_decode_job, jobs, chunksize=4)):
-            cache[i] = torch.from_numpy(arr).permute(2, 0, 1)
+        for i, (rgb_arr, mask_arr) in enumerate(pool.map(_decode_job, jobs, chunksize=4)):
+            cache[i, :3] = torch.from_numpy(rgb_arr).permute(2, 0, 1)
+            cache[i, 3] = torch.from_numpy(mask_arr)
     return cache
 
 
@@ -93,17 +103,34 @@ class CameraDataset(Dataset):
         
     def __getitem__(self, index):
         viewpoint_cam = self.viewpoint_stack[index]
+        mask = None
         if viewpoint_cam.meta_only:
             if self.image_cache is not None:
-                viewpoint_image = self.image_cache[index].float().div_(255.0)
+                cached = self.image_cache[index].float().div_(255.0)
+                viewpoint_image, mask = cached[:3], cached[3:4]
             else:
-                arr = _composite_and_resize(viewpoint_cam.image_path, viewpoint_cam.resolution, self.bg)
-                viewpoint_image = torch.from_numpy(arr).permute(2, 0, 1).float().div_(255.0)
+                rgb_arr, mask_arr = _composite_and_resize(
+                    viewpoint_cam.image_path, viewpoint_cam.resolution, self.bg)
+                viewpoint_image = torch.from_numpy(rgb_arr).permute(2, 0, 1).float().div_(255.0)
+                mask = torch.from_numpy(mask_arr).float().div_(255.0)[None]
             viewpoint_image = viewpoint_image.clamp_(0.0, 1.0)
+            mask = mask.clamp_(0.0, 1.0)
         else:
             viewpoint_image = viewpoint_cam.image
-            
-        return viewpoint_image, viewpoint_cam
+            # gt_alpha_mask was already set on this camera at construction
+            # time for the eager (non-dataloader) path; nothing to return.
+
+        # lambda_opa_mask's ground truth, returned alongside the image rather
+        # than attached to `viewpoint_cam` itself: `viewpoint_stack` entries
+        # are the SAME long-lived Camera objects every epoch draws from again,
+        # and mutating one with a freshly allocated tensor per __getitem__
+        # call orphaned the shared-memory segment torch's DataLoader IPC
+        # promotes each returned tensor into -- persistent_workers never got
+        # a chance to release the previous one, so /dev/shm grew without
+        # bound over the run instead of staying at its steady-state prefetch
+        # size. Returning it as its own value follows viewpoint_image's own
+        # proven-safe pattern instead.
+        return viewpoint_image, mask, viewpoint_cam
     
     def __len__(self):
         return len(self.viewpoint_stack)

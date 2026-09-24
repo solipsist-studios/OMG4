@@ -90,7 +90,7 @@ def calc_gradient(dataset, opt, pipe, scene, gaussians, batch_size, bg_color, ba
         num_iter = len(training_dataset)
 
     for idx in tqdm(range(num_iter), desc="Computing Gradients"):
-        gt_image, viewpoint_cam = training_dataset[idx]
+        gt_image, _gt_alpha_mask, viewpoint_cam = training_dataset[idx]
         gt_image= gt_image.cuda()
         viewpoint_cam = viewpoint_cam.cuda()
 
